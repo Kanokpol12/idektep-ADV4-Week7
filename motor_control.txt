@@ -1,0 +1,227 @@
+#include <Arduino.h>
+#include "motor_control.h"
+#include <AccelStepper.h>
+#include <stdint.h>
+#include <Servo.h>
+
+Servo myservo1;
+Servo myservo2;
+
+#define MOTORX_STEP_PIN 2
+#define MOTORX_DIR_PIN 5
+#define MOTORY_STEP_PIN 3
+#define MOTORY_DIR_PIN 6
+#define MOTORZ_STEP_PIN 4
+#define MOTORZ_DIR_PIN 7
+
+//---------- Limit switch ----------//
+
+#define LIMITSWITCHX_PIN 9
+#define LIMITSWITCHY_PIN 10
+#define LIMITSWITCHZ_PIN 11
+#define INTERRUPT_PIN 99
+
+//---------------------------------//
+
+int MICROSTEP_RES = 16;
+int STEPRATE = 50;
+int STEP_INCREMENT = 100;
+int TO_MILLI = 10;
+
+volatile bool INTERRUPT_FLAG = false;
+
+AccelStepper MOTORX(AccelStepper::DRIVER, MOTORX_STEP_PIN, MOTORX_DIR_PIN);
+AccelStepper MOTORY(AccelStepper::DRIVER, MOTORY_STEP_PIN, MOTORY_DIR_PIN);
+AccelStepper MOTORZ(AccelStepper::DRIVER, MOTORZ_STEP_PIN, MOTORZ_DIR_PIN);
+
+void motorSetup(uint16_t maxSpeed, uint16_t maxAccel)
+{
+
+  //----------- Limit switch -----------------------//
+
+  pinMode(LIMITSWITCHX_PIN, INPUT_PULLUP);
+  pinMode(LIMITSWITCHY_PIN, INPUT_PULLUP);
+  pinMode(LIMITSWITCHZ_PIN, INPUT_PULLUP);
+
+  //-----------------------------------------------//
+
+  MOTORX.setMaxSpeed(maxSpeed);
+  MOTORY.setMaxSpeed(maxSpeed);
+  MOTORZ.setMaxSpeed(maxSpeed);
+  MOTORX.setAcceleration(maxAccel);
+  MOTORY.setAcceleration(maxAccel);
+  MOTORZ.setAcceleration(maxAccel);
+
+  //------------------------------------------------//
+  myservo1.attach(12);
+  myservo2.attach(13);
+}
+
+//----------------Home position -----------------//
+void homePosition()
+{
+  //------------Z Process -------------// รัน Z ก่อนเพื่อนกันชนกับstamper
+  MOTORZ.setSpeed(-3000);
+  while (digitalRead(LIMITSWITCHZ_PIN) == HIGH)
+  {
+    MOTORZ.runSpeed();
+  }
+
+  MOTORZ.setCurrentPosition(0);
+  //------------Y Process -------------// รัน Y ก่อนเพื่อนกันชนกับกล้องตอนSethome
+  MOTORY.setSpeed(-3000);
+  while (digitalRead(LIMITSWITCHY_PIN) == HIGH)
+  {
+    MOTORY.runSpeed();
+  }
+  MOTORY.setCurrentPosition(0);
+
+  //------------X Process -------------//
+  MOTORX.setSpeed(-3000);
+  while (digitalRead(LIMITSWITCHX_PIN) == HIGH)
+  {
+    MOTORX.runSpeed();
+  }
+  MOTORX.setCurrentPosition(0);
+
+  //----------------------------------//
+  moveTomm(47.8, 1, 3); //                              //moveTomm(_____,_____,_____);
+  // Rotate(112);
+  MOTORX.setCurrentPosition(0);
+  MOTORY.setCurrentPosition(0);
+  MOTORZ.setCurrentPosition(0);
+  Serial.println("Sethome position");
+  delay(1000);
+}
+
+//---------------------------------------------------------//
+
+void moveTomm(float targetX, float targetY, float targetZ)
+{
+  MOTORX.setSpeed(10000); // original speed 10000
+  MOTORY.setSpeed(10000); // original speed 10000
+  MOTORZ.setSpeed(10000); // original speed 10000
+
+  float stepsX = targetX * MICROSTEP_RES * STEPRATE / TO_MILLI;
+  float stepsY = targetY * MICROSTEP_RES * STEPRATE / TO_MILLI;
+  float stepsZ = targetZ * MICROSTEP_RES * STEPRATE / TO_MILLI;
+
+  MOTORX.moveTo(stepsX);
+  MOTORY.moveTo(stepsY);
+  MOTORZ.moveTo(stepsZ);
+
+  while (MOTORX.distanceToGo() != 0 || MOTORY.distanceToGo() != 0 || MOTORZ.distanceToGo() != 0)
+  {
+    if (INTERRUPT_FLAG)
+    {
+      interruptLoop();
+      Serial.println("Cartesian was interrupted..!");
+      resetBoard();
+    }
+    else
+    {
+      MOTORX.run();
+      MOTORY.run();
+      MOTORZ.run();
+    }
+  }
+
+  Serial.print("X: ");
+  Serial.print(targetX);
+  Serial.print(" mm, ");
+  Serial.print("y: ");
+  Serial.print(targetY);
+  Serial.print(" mm, ");
+  Serial.print("Z: ");
+  Serial.print(targetZ);
+  Serial.println(" mm");
+}
+
+//----------------------------------- Servo control ---------------//
+void Gripped(float pos)
+{
+
+  myservo1.write(pos); // 50 [ grasp ] --- 120 [ release ]
+}
+
+void Rotate(float pos)
+{
+
+  myservo2.write(pos); // 9 [ 0 deg.]  --- 102 [ 90 deg.]
+}
+
+//-----------------------------------------------------------------//
+
+void interruptLoop()
+{
+  INTERRUPT_FLAG = true; // ตั้งค่าสถานะให้หยุด loop
+}
+
+/////////////////////////////////////////////////////////////////////
+void resetBoard()
+{
+  Serial.println("Arduino reset...");
+  delay(1000);
+  asm volatile("  jmp 0"); // คำสั่ง Assembly สำหรับรีเซ็ตบอร์ด
+}
+
+void receiveSerialCommand()
+{
+  if (Serial.available())
+  {
+    String command = Serial.readStringUntil('\n');
+    command.trim(); // ลบช่องว่างหน้า-หลัง
+
+    if (command == "home")
+    {
+      Serial.println("Start homing...");
+      homePosition();
+      Serial.println("Sethome position"); // แจ้งกลับ Python
+    }
+    else if (command == "ready")
+    {
+      Serial.println("Ready to detect"); // แจ้งกลับ Python
+    }
+    else if (command.startsWith("G"))
+    {
+      // Example: G1 X20 Y30
+      int xIndex = command.indexOf('X');
+      int yIndex = command.indexOf('Y');
+
+      if (xIndex > 0 && yIndex > 0)
+      {
+        float x = command.substring(xIndex + 1, yIndex).toFloat();
+        float y = command.substring(yIndex + 1).toFloat();
+
+        Serial.print("Moving to X:");
+        Serial.print(x);
+        Serial.print(" Y:");
+        Serial.println(y);
+
+        //------------ Cartesian moving to pick objects ------------------//
+        //////////////////////////////////////////////////////////////////////ไม่สามารถแยก path fnc ออกมาสร้าง void ใหม่ได้เพราะมีการรับตัวแปร x,y มาจากคำสั่งก่อนหน้าด้านบน
+        moveTomm(x, y, 0); // ใส่ค่า Z ที่เหมาะสม เช่น 3
+        Rotate(9);
+        delay(1000);
+        moveTomm(x, y, 112);
+        Gripped(25);
+        moveTomm(x, y, 0);
+        delay(2000);
+        moveTomm(x, y, 108);
+        Gripped(150);
+        delay(1000);
+        moveTomm(x, y, 0);
+        homePosition();
+        Serial.println("Sucess to pick objects"); // แจ้งกลับ Python
+
+        //---------------------------------------------------------------//
+      }
+    }
+    else
+    {
+      Serial.println("Unknown command");
+    }
+  }
+}
+
+
